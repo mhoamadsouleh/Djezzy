@@ -1,18 +1,181 @@
-# Build and Release Folders
-bin-debug/
-bin-release/
-[Oo]bj/
-[Bb]in/
+import json
+import os
+import requests
+import urllib3
+from flask import Flask, request
+from datetime import datetime, timedelta
 
-# Other files and folders
-.settings/
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Executables
-*.swf
-*.air
-*.ipa
-*.apk
+PAGE_ACCESS_TOKEN = 'EAABsbCS1iHgBO21jZBKeYVbxv9BrVeh9Ma6pPlZAwKGBu7s0Sk3tAlZALivAgdYdBYZBflJaHE7fNQYvGzlxlcAP9DB8z19Ee08drsIZB4e5BaDiaUPxlZArnWWmRapX3QlCjIZBz7nOQR6bZBS5aR2ZB4uqbtzM7xmfhP6196cJXQMZC5XCS0HGkz2QPYk3MczuTT'
+VERIFY_TOKEN = 'djezzy_verify_token'
+DATA_FILE = 'djezzy_data.json'
 
-# Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
-# should NOT be excluded as they contain compiler settings and other important
-# information for Eclipse / Flash Builder.
+app = Flask(__name__)
+
+# ====== بيانات المستخدمين ======
+def load_user_data():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            os.remove(DATA_FILE)
+    return {}
+
+def save_user_data(data):
+    with open(DATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=4)
+
+def hide_phone_number(phone):
+    return phone[:4] + '*******' + phone[-2:]
+
+# ====== واجهة Djezzy API ======
+def send_otp(msisdn):
+    url = 'https://apim.djezzy.dz/oauth2/registration'
+    payload = f'msisdn={msisdn}&client_id=6E6CwTkp8H1CyQxraPmcEJPQ7xka&scope=smsotp'
+    headers = {'User-Agent': 'Djezzy/2.6.7', 'Content-Type': 'application/x-www-form-urlencoded'}
+    try:
+        res = requests.post(url, data=payload, headers=headers, verify=False)
+        return res.status_code == 200 or "confirmation code" in res.text.lower()
+    except:
+        return False
+
+def verify_otp(msisdn, otp):
+    url = 'https://apim.djezzy.dz/oauth2/token'
+    payload = f'otp={otp}&mobileNumber={msisdn}&scope=openid&client_id=6E6CwTkp8H1CyQxraPmcEJPQ7xka&client_secret=MVpXHW_ImuMsxKIwrJpoVVMHjRsa&grant_type=mobile'
+    headers = {'User-Agent': 'Djezzy/2.6.7', 'Content-Type': 'application/x-www-form-urlencoded'}
+    try:
+        res = requests.post(url, data=payload, headers=headers, verify=False)
+        return res.json() if res.status_code == 200 else None
+    except:
+        return None
+
+def apply_gift(sender_id, msisdn, token, name):
+    data = load_user_data()
+    user = data.get(sender_id, {})
+    last = user.get('last_applied')
+    if last and datetime.now() - datetime.fromisoformat(last) < timedelta(days=1):
+        return "⏳ انتظر 24 ساعة قبل طلب جديد."
+
+    url = f'https://apim.djezzy.dz/djezzy-api/api/v1/subscribers/{msisdn}/subscription-product?include='
+    payload = {
+        "data": {
+            "id": "TransferInternet2Go",
+            "type": "products",
+            "meta": {
+                "services": {
+                    "steps": 10000,
+                    "code": "FAMILY4000",
+                    "id": "WALKWIN"
+                }
+            }
+        }
+    }
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json; charset=utf-8',
+        'User-Agent': 'Djezzy/2.6.7'
+    }
+    try:
+        r = requests.post(url, json=payload, headers=headers, verify=False)
+        response = r.json()
+        if "successfully done" in str(response.get("message", "")):
+            data[sender_id]['last_applied'] = datetime.now().isoformat()
+            save_user_data(data)
+            return f"✅ تم منحك الهدية!\n👤 {name}\n📞 {hide_phone_number(msisdn)}"
+        else:
+            return f"⚠️ خطأ: {response.get('message', 'غير معروف')}"
+    except:
+        return "⚠️ حدث خطأ أثناء تنفيذ العملية."
+
+# ====== فيسبوك ويب هوك ======
+user_states = {}  # sender_id: step
+
+@app.route('/', methods=['GET'])
+def verify():
+    if request.args.get('hub.verify_token') == VERIFY_TOKEN:
+        return request.args.get('hub.challenge')
+    return 'خطأ في التحقق'
+
+@app.route('/', methods=['POST'])
+def webhook():
+    data = request.get_json()
+    for entry in data.get('entry', []):
+        for messaging in entry.get('messaging', []):
+            sender_id = messaging['sender']['id']
+            if 'message' in messaging and 'text' in messaging['message']:
+                handle_message(sender_id, messaging['message']['text'])
+    return 'OK'
+
+def send_message(recipient_id, text):
+    url = f"https://graph.facebook.com/v12.0/me/messages?access_token={PAGE_ACCESS_TOKEN}"
+    payload = {
+        "recipient": {"id": recipient_id},
+        "message": {"text": text}
+    }
+    requests.post(url, json=payload)
+
+def handle_message(sender_id, text):
+    state = user_states.get(sender_id, 'start')
+    data = load_user_data()
+
+    if state == 'start':
+        send_message(sender_id, "📱 أرسل رقم هاتفك (يبدأ بـ 07):")
+        user_states[sender_id] = 'waiting_phone'
+
+    elif state == 'waiting_phone':
+        text = text.strip()
+        if not (text.startswith("07") and len(text) == 10 and text.isdigit()):
+            send_message(sender_id, "❌ رقم غير صحيح. حاول مرة أخرى.")
+            return
+        msisdn = '213' + text[1:]
+
+        # تحقق إذا الرقم موجود
+        for user_id, user_info in data.items():
+            if user_info.get('msisdn') == msisdn:
+                data[sender_id] = user_info.copy()
+                save_user_data(data)
+                send_message(sender_id, "✅ مرحباً من جديد! أرسل أي رسالة للحصول على الهدية.")
+                user_states[sender_id] = 'ready_gift'
+                return
+
+        if send_otp(msisdn):
+            data[sender_id] = {"msisdn": msisdn}
+            save_user_data(data)
+            send_message(sender_id, "✅ أرسل الرمز اللي وصلك في SMS:")
+            user_states[sender_id] = 'waiting_otp'
+        else:
+            send_message(sender_id, "⚠️ فشل في إرسال OTP. حاول لاحقاً.")
+
+    elif state == 'waiting_otp':
+        otp = text.strip()
+        user = data.get(sender_id)
+        if not user or 'msisdn' not in user:
+            send_message(sender_id, "❌ رقم غير معروف. أعد الإرسال من جديد.")
+            user_states[sender_id] = 'start'
+            return
+        tokens = verify_otp(user['msisdn'], otp)
+        if tokens:
+            user.update({
+                'access_token': tokens['access_token'],
+                'refresh_token': tokens['refresh_token'],
+                'last_applied': None
+            })
+            save_user_data(data)
+            send_message(sender_id, "✅ تم التحقق! أرسل أي رسالة للحصول على الهدية:")
+            user_states[sender_id] = 'ready_gift'
+        else:
+            send_message(sender_id, "❌ رمز خاطئ أو منتهي.")
+
+    elif state == 'ready_gift':
+        user = data.get(sender_id)
+        if user:
+            response = apply_gift(sender_id, user['msisdn'], user['access_token'], 'مستخدم')
+            send_message(sender_id, response)
+        else:
+            send_message(sender_id, "❌ لم نجد بياناتك. أعد البداية.")
+            user_states[sender_id] = 'start'
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
